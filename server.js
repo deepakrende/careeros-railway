@@ -3,16 +3,15 @@ import pg from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { randomUUID } from 'node:crypto';
-import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promises as fs } from 'node:fs';
 
 const { Pool } = pg;
 const app = express();
 const PORT = process.env.PORT || 3000;
-// Set FILE_STORAGE_DIR to the Railway Volume mount path (recommended: /data).
-// Resume/document uploads are introduced in a later phase; this prepares the persistent mount.
-const FILE_STORAGE_DIR = process.env.FILE_STORAGE_DIR || '';
+const FILE_STORAGE_DIR = process.env.FILE_STORAGE_DIR || '/data';
+const RESUME_DIR = path.join(FILE_STORAGE_DIR, 'resumes');
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) { console.error('Missing JWT_SECRET. Add a strong secret in Railway service variables.'); process.exit(1); }
 if (!process.env.DATABASE_URL) { console.error('Missing DATABASE_URL. Add your Railway PostgreSQL connection variable.'); process.exit(1); }
@@ -37,27 +36,25 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'todo';
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 UPDATE tasks SET status = CASE WHEN completed THEN 'completed' ELSE 'todo' END WHERE status IS NULL OR (completed = TRUE AND status = 'todo');
 UPDATE tasks SET completed = (status = 'completed') WHERE completed IS DISTINCT FROM (status = 'completed');
-CREATE TABLE IF NOT EXISTS user_preferences (
- user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
- display_name TEXT NOT NULL DEFAULT '',
- target_role TEXT NOT NULL DEFAULT '',
- location TEXT NOT NULL DEFAULT '',
- timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata',
- theme TEXT NOT NULL DEFAULT 'dark' CHECK (theme IN ('light','dark')),
- week_starts_on TEXT NOT NULL DEFAULT 'monday' CHECK (week_starts_on IN ('monday','sunday')),
- daily_task_goal INTEGER NOT NULL DEFAULT 5 CHECK (daily_task_goal BETWEEN 1 AND 30),
- created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
- updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS resumes (
+ id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ original_name TEXT NOT NULL, stored_name TEXT NOT NULL, mime_type TEXT NOT NULL DEFAULT 'application/pdf',
+ size_bytes BIGINT NOT NULL, target_role TEXT, version_label TEXT NOT NULL, notes TEXT,
+ archived BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE TABLE IF NOT EXISTS task_activity_events (
- id UUID PRIMARY KEY,
- user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
- task_id TEXT NOT NULL,
- event_type TEXT NOT NULL,
- details JSONB NOT NULL DEFAULT '{}'::jsonb,
- created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS task_activity_user_created_idx ON task_activity_events(user_id, created_at DESC);
+ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS job_id TEXT;
+ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS job_type TEXT;
+ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS experience_level TEXT;
+ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS job_description TEXT;
+ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS recruiter_name TEXT;
+ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS recruiter_email TEXT;
+ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS notes TEXT;
+ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS resume_id UUID REFERENCES resumes(id) ON DELETE SET NULL;
+ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+CREATE INDEX IF NOT EXISTS resumes_user_idx ON resumes(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS job_applications_user_applied_idx ON job_applications(user_id, applied_on DESC);
+CREATE INDEX IF NOT EXISTS job_applications_user_status_idx ON job_applications(user_id, status);
 CREATE TABLE IF NOT EXISTS task_notifications (id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, title TEXT NOT NULL, due_date DATE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), read_at TIMESTAMPTZ, UNIQUE(task_id));
 CREATE TABLE IF NOT EXISTS task_completion_events (id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, activity_date DATE NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, task_id, activity_date));
 CREATE INDEX IF NOT EXISTS task_completion_user_date_idx ON task_completion_events(user_id, activity_date DESC);
@@ -81,7 +78,7 @@ async function ensureDb() {
    CREATE TABLE IF NOT EXISTS learning_topics (id TEXT PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, topic TEXT NOT NULL, items JSONB NOT NULL DEFAULT '[]'::jsonb, progress INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
   `);
   await pool.query(schema);
-  if (FILE_STORAGE_DIR) await Promise.all([mkdir(path.join(FILE_STORAGE_DIR,'resumes'), { recursive: true }), mkdir(path.join(FILE_STORAGE_DIR,'documents'), { recursive: true })]);
+  await fs.mkdir(RESUME_DIR, { recursive: true });
  })();
  return dbReady;
 }
@@ -91,7 +88,7 @@ function auth(req, res, next) {
  if (!token) return res.status(401).json({ error: 'Please sign in to continue.' });
  try { req.user = jwt.verify(token, JWT_SECRET); next(); } catch { return res.status(401).json({ error: 'Your session expired. Please sign in again.' }); }
 }
-app.get('/api/health', (_req,res)=>res.json({ok:true, database: Boolean(process.env.DATABASE_URL), fileStorageConfigured: Boolean(FILE_STORAGE_DIR)}));
+app.get('/api/health', (_req,res)=>res.json({ok:true, database:Boolean(process.env.DATABASE_URL), fileStorageConfigured:Boolean(process.env.FILE_STORAGE_DIR)}));
 app.post('/api/auth/register', async (req,res,next)=>{
  try { const email=String(req.body.email||'').trim().toLowerCase(), password=String(req.body.password||'');
   if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({error:'Enter a valid email address.'});
@@ -111,44 +108,70 @@ app.post('/api/auth/login', async(req,res,next)=>{
 });
 app.get('/api/me',auth,(req,res)=>res.json({user:{id:req.user.id,email:req.user.email}}));
 
-const defaultPreferences = userId => ({user_id:userId,display_name:'',target_role:'',location:'',timezone:'Asia/Kolkata',theme:'dark',week_starts_on:'monday',daily_task_goal:5});
-async function readPreferences(userId) {
- const {rows}=await pool.query(`INSERT INTO user_preferences(user_id) VALUES($1) ON CONFLICT(user_id) DO NOTHING`,[userId]);
- const result=await pool.query('SELECT * FROM user_preferences WHERE user_id=$1',[userId]);
- return result.rows[0] || defaultPreferences(userId);
-}
-function validTimezone(value) {
- try { new Intl.DateTimeFormat('en-US',{timeZone:value}).format(new Date()); return true; }
- catch { return false; }
-}
-function dateInTimezone(timeZone) {
- const parts=new Intl.DateTimeFormat('en-CA',{timeZone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());
- const values=Object.fromEntries(parts.map(part=>[part.type,part.value]));
- return `${values.year}-${values.month}-${values.day}`;
-}
-app.get('/api/preferences',auth,async(req,res,next)=>{
- try { res.json({preferences:await readPreferences(req.user.id)}); } catch(e){next(e)}
+// Job-search workspace: resume PDFs live on the Railway Volume, metadata stays in PostgreSQL.
+app.get('/api/resumes', auth, async (req,res,next)=>{
+ try { const {rows}=await pool.query('SELECT id,original_name,size_bytes,target_role,version_label,notes,archived,created_at FROM resumes WHERE user_id=$1 ORDER BY created_at DESC',[req.user.id]); res.json({resumes:rows}); }
+ catch(e){next(e)}
 });
-app.patch('/api/preferences',auth,async(req,res,next)=>{
+app.post('/api/resumes/upload', auth, express.raw({type:'application/pdf',limit:'15mb'}), async (req,res,next)=>{
+ let storedName;
  try {
-  const current=await readPreferences(req.user.id);
-  const allowed=['display_name','target_role','location','timezone','theme','week_starts_on','daily_task_goal'];
-  const data={}; for(const key of allowed) if(Object.prototype.hasOwnProperty.call(req.body,key)) data[key]=req.body[key];
-  for(const key of ['display_name','target_role','location']) if(key in data){data[key]=String(data[key]??'').trim();if(data[key].length>120)return res.status(400).json({error:`${key.replace('_',' ')} must be 120 characters or fewer.`});}
-  if('timezone' in data){data.timezone=String(data.timezone||'');if(!validTimezone(data.timezone))return res.status(400).json({error:'Enter a valid IANA timezone, such as Asia/Kolkata.'});}
-  if('theme' in data&&!['light','dark'].includes(data.theme))return res.status(400).json({error:'Theme must be light or dark.'});
-  if('week_starts_on' in data&&!['monday','sunday'].includes(data.week_starts_on))return res.status(400).json({error:'Week must start on Monday or Sunday.'});
-  if('daily_task_goal' in data){data.daily_task_goal=Number(data.daily_task_goal);if(!Number.isInteger(data.daily_task_goal)||data.daily_task_goal<1||data.daily_task_goal>30)return res.status(400).json({error:'Daily task goal must be between 1 and 30.'});}
-  const keys=Object.keys(data); if(!keys.length)return res.json({preferences:current});
-  const values=keys.map(key=>data[key]); const sets=keys.map((key,index)=>`${key}=$${index+1}`);
-  values.push(req.user.id);
-  const {rows}=await pool.query(`UPDATE user_preferences SET ${sets.join(',')},updated_at=NOW() WHERE user_id=$${values.length} RETURNING *`,values);
-  res.json({preferences:rows[0]});
- } catch(e){next(e)}
+  const decodeHeader=v=>{try{return decodeURIComponent(String(v||''))}catch{return String(v||'')}};
+  const originalName=decodeHeader(req.headers['x-file-name']||'resume.pdf').replace(/[\\/\\0-\\r\\n]/g,'_').slice(0,180);
+  const versionLabel=decodeHeader(req.headers['x-version-label']||'Resume').trim().slice(0,80)||'Resume';
+  const targetRole=decodeHeader(req.headers['x-target-role']||'').trim().slice(0,120)||null;
+  const notes=decodeHeader(req.headers['x-notes']||'').trim().slice(0,2000)||null;
+  if(!Buffer.isBuffer(req.body)||req.body.length<8||req.body.subarray(0,5).toString()!=='%PDF-')return res.status(400).json({error:'Upload a valid PDF resume.'});
+  storedName=`${randomUUID()}.pdf`;
+  await fs.mkdir(RESUME_DIR,{recursive:true});
+  await fs.writeFile(path.join(RESUME_DIR,storedName),req.body,{flag:'wx'});
+  const {rows}=await pool.query(`INSERT INTO resumes(id,user_id,original_name,stored_name,mime_type,size_bytes,target_role,version_label,notes) VALUES($1,$2,$3,$4,'application/pdf',$5,$6,$7,$8) RETURNING id,original_name,size_bytes,target_role,version_label,notes,archived,created_at`,[randomUUID(),req.user.id,originalName,storedName,req.body.length,targetRole,versionLabel,notes]);
+  res.status(201).json({resume:rows[0]});
+ } catch(e){ if(storedName)await fs.unlink(path.join(RESUME_DIR,storedName)).catch(()=>{}); if(e.status===413)return res.status(413).json({error:'PDF must be 15 MB or smaller.'}); next(e); }
 });
-async function logTaskEvent(userId,taskId,eventType,details={}) {
- await pool.query('INSERT INTO task_activity_events(id,user_id,task_id,event_type,details) VALUES($1,$2,$3,$4,$5::jsonb)',[randomUUID(),userId,String(taskId),eventType,JSON.stringify(details)]);
-}
+app.get('/api/resumes/:id/download', auth, async(req,res,next)=>{
+ try { const {rows}=await pool.query('SELECT original_name,stored_name FROM resumes WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]); if(!rows[0])return res.status(404).json({error:'Resume not found.'});
+  const filePath=path.join(RESUME_DIR,rows[0].stored_name); await fs.access(filePath);
+  res.setHeader('Content-Type','application/pdf');res.setHeader('Content-Disposition',`inline; filename="${rows[0].original_name.replace(/["\\r\\n]/g,'_')}"`);res.sendFile(filePath);
+ }catch(e){if(e.code==='ENOENT')return res.status(404).json({error:'Resume file is missing from storage.'});next(e)}
+});
+app.patch('/api/resumes/:id', auth, async(req,res,next)=>{
+ try {const allowed=['version_label','target_role','notes','archived'];const data={};for(const k of allowed)if(k in req.body)data[k]=req.body[k];if(!Object.keys(data).length)return res.status(400).json({error:'No valid resume fields supplied.'});
+  const keys=Object.keys(data),vals=keys.map(k=>data[k]),sets=keys.map((k,i)=>`${k}=$${i+1}`);vals.push(req.params.id,req.user.id);
+  const {rows}=await pool.query(`UPDATE resumes SET ${sets.join(',')} WHERE id=$${keys.length+1} AND user_id=$${keys.length+2} RETURNING id,original_name,size_bytes,target_role,version_label,notes,archived,created_at`,vals);if(!rows[0])return res.status(404).json({error:'Resume not found.'});res.json({resume:rows[0]});
+ }catch(e){next(e)}
+});
+app.delete('/api/resumes/:id', auth, async(req,res,next)=>{
+ try {const {rows}=await pool.query('DELETE FROM resumes WHERE id=$1 AND user_id=$2 RETURNING stored_name',[req.params.id,req.user.id]);if(!rows[0])return res.status(404).json({error:'Resume not found.'});await fs.unlink(path.join(RESUME_DIR,rows[0].stored_name)).catch(()=>{});res.json({ok:true});}
+ catch(e){next(e)}
+});
+app.get('/api/job-applications', auth, async(req,res,next)=>{
+ try {const {rows}=await pool.query(`SELECT j.*,r.version_label AS resume_version,r.original_name AS resume_filename FROM job_applications j LEFT JOIN resumes r ON r.id=j.resume_id AND r.user_id=j.user_id WHERE j.user_id=$1 ORDER BY j.applied_on DESC NULLS LAST,j.created_at DESC`,[req.user.id]);res.json({applications:rows});}
+ catch(e){next(e)}
+});
+const applicationFields=['company','role','status','applied_on','location','salary','url','job_id','job_type','experience_level','source','job_description','recruiter_name','recruiter_email','notes','resume_id'];
+const applicationStatuses=['saved','applied','assessment','interview_scheduled','interview_completed','hr_discussion','offer','rejected','withdrawn'];
+app.post('/api/job-applications', auth, async(req,res,next)=>{
+ try {const data={};for(const k of applicationFields)if(k in req.body)data[k]=req.body[k];
+  data.company=String(data.company||'').trim();data.role=String(data.role||'').trim();if(!data.company||!data.role)return res.status(400).json({error:'Company and job role are required.'});
+  data.status=data.status||'saved';if(!applicationStatuses.includes(data.status))return res.status(400).json({error:'Choose a valid application status.'});
+  if(data.resume_id){const r=await pool.query('SELECT id FROM resumes WHERE id=$1 AND user_id=$2',[data.resume_id,req.user.id]);if(!r.rowCount)return res.status(400).json({error:'Selected resume does not belong to your account.'});}
+  const id=randomUUID(),keys=Object.keys(data),cols=['id','user_id',...keys],vals=[id,req.user.id,...keys.map(k=>cleanValue(k,data[k]))],ph=vals.map((_,i)=>`$${i+1}`);
+  const {rows}=await pool.query(`INSERT INTO job_applications(${cols.join(',')}) VALUES(${ph.join(',')}) RETURNING *`,vals);res.status(201).json({application:rows[0]});
+ }catch(e){next(e)}
+});
+app.patch('/api/job-applications/:id', auth, async(req,res,next)=>{
+ try {const data={};for(const k of applicationFields)if(k in req.body)data[k]=req.body[k];if(!Object.keys(data).length)return res.status(400).json({error:'No valid application fields supplied.'});
+  if(data.status&&!applicationStatuses.includes(data.status))return res.status(400).json({error:'Choose a valid application status.'});
+  if(data.resume_id){const r=await pool.query('SELECT id FROM resumes WHERE id=$1 AND user_id=$2',[data.resume_id,req.user.id]);if(!r.rowCount)return res.status(400).json({error:'Selected resume does not belong to your account.'});}
+  const keys=Object.keys(data),vals=keys.map(k=>cleanValue(k,data[k])),sets=keys.map((k,i)=>`${k}=$${i+1}`);vals.push(req.params.id,req.user.id);
+  const {rows}=await pool.query(`UPDATE job_applications SET ${sets.join(',')},updated_at=NOW() WHERE id=$${keys.length+1} AND user_id=$${keys.length+2} RETURNING *`,vals);if(!rows[0])return res.status(404).json({error:'Application not found.'});res.json({application:rows[0]});
+ }catch(e){next(e)}
+});
+app.delete('/api/job-applications/:id', auth, async(req,res,next)=>{
+ try {const r=await pool.query('DELETE FROM job_applications WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]);if(!r.rowCount)return res.status(404).json({error:'Application not found.'});res.json({ok:true});}
+ catch(e){next(e)}
+});
 
 app.get('/api/bootstrap',auth,async(req,res,next)=>{
  try { const {rows}=await pool.query('SELECT * FROM tasks WHERE user_id=$1 ORDER BY due_date NULLS LAST, start_time NULLS LAST, created_at DESC',[req.user.id]); res.json({tasks:rows}); }
@@ -176,9 +199,10 @@ function normalizeDateValue(value) {
  if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== day) return null;
  return iso;
 }
-function nextDateFor(task, today = new Date().toISOString().slice(0, 10)) {
+function nextDateFor(task) {
  const due = normalizeDateValue(task.due_date);
  if (!due) return null;
+ const today = new Date().toISOString().slice(0, 10);
  const baseIso = due > today ? due : today;
  const base = new Date(`${baseIso}T12:00:00.000Z`);
  if (Number.isNaN(base.getTime())) return null;
@@ -225,8 +249,7 @@ app.post('/api/tasks',auth,async(req,res,next)=>{
   const vals=[id,req.user.id,...keys.map(k=>cleanValue(k,data[k])),completedAt];
   const placeholders=vals.map((_,i)=>`$${i+1}`);
   const {rows}=await pool.query(`INSERT INTO tasks(${cols.join(',')}) VALUES(${placeholders.join(',')}) RETURNING *`,vals);
-  await logTaskEvent(req.user.id,id,'created',{title:rows[0].title,status:rows[0].status});
-  if(data.completed){const prefs=await readPreferences(req.user.id);const activityDate=normalizeDateValue(req.body.activity_date)||dateInTimezone(prefs.timezone);await pool.query('INSERT INTO task_completion_events(id,user_id,task_id,activity_date) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING',[randomUUID(),req.user.id,id,activityDate]);}
+  if(data.completed){const activityDate=normalizeDateValue(req.body.activity_date)||new Date().toISOString().slice(0,10);await pool.query('INSERT INTO task_completion_events(id,user_id,task_id,activity_date) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING',[randomUUID(),req.user.id,id,activityDate]);}
   res.status(201).json({item:rows[0]});
  }catch(e){next(e)}
 });
@@ -254,20 +277,17 @@ app.patch('/api/tasks/:id',auth,async(req,res,next)=>{
   const {rows}=await pool.query(`UPDATE tasks SET ${sets.join(',')} WHERE id=$${keys.length+1} AND user_id=$${keys.length+2} RETURNING *`,vals);
   const task=rows[0];
   if(reminderChanged){await pool.query('UPDATE tasks SET reminder_notified_at=NULL WHERE id=$1 AND user_id=$2',[task.id,req.user.id]);await pool.query('DELETE FROM task_notifications WHERE task_id=$1 AND user_id=$2',[task.id,req.user.id]);task.reminder_notified_at=null;}
-  let userTimezone='Asia/Kolkata';
-  if(newlyCompleted){const prefs=await readPreferences(req.user.id);userTimezone=prefs.timezone;const day=activityDate||dateInTimezone(userTimezone);await pool.query('INSERT INTO task_completion_events(id,user_id,task_id,activity_date) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING',[randomUUID(),req.user.id,task.id,day]);}
-  if(existing.status!==task.status || existing.completed!==task.completed) await logTaskEvent(req.user.id,task.id,'status_changed',{from:existing.status|| (existing.completed?'completed':'todo'),to:task.status});
-  else await logTaskEvent(req.user.id,task.id,'updated',{fields:keys});
+  if(newlyCompleted){const day=activityDate||new Date().toISOString().slice(0,10);await pool.query('INSERT INTO task_completion_events(id,user_id,task_id,activity_date) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING',[randomUUID(),req.user.id,task.id,day]);}
   let nextOccurrence=null;
   if(newlyCompleted && task.recurrence_rule!=='none' && !task.next_occurrence_created){
-   const nextDate=nextDateFor(task,dateInTimezone(userTimezone));
+   const nextDate=nextDateFor(task);
    await pool.query('UPDATE tasks SET next_occurrence_created=TRUE WHERE id=$1 AND user_id=$2',[task.id,req.user.id]);
-   if(nextDate){const newId=randomUUID();const {rows:created}=await pool.query(`INSERT INTO tasks(id,user_id,title,category,priority,due_date,completed,minutes,start_time,end_time,notes,reminder_time,recurrence_rule,recurrence_days,recurrence_end,recurrence_parent_id,status) VALUES($1,$2,$3,$4,$5,$6,FALSE,$7,$8,$9,$10,$11,$12,$13,$14,$15,'todo') RETURNING *`,[newId,req.user.id,task.title,task.category,task.priority,nextDate,task.minutes,task.start_time,task.end_time,task.notes,task.reminder_time,task.recurrence_rule,JSON.stringify(task.recurrence_days||[]),task.recurrence_end,task.recurrence_parent_id||task.id]);nextOccurrence=created[0];await logTaskEvent(req.user.id,newId,'created',{title:created[0].title,status:'todo',recurrence_parent_id:task.id});}
+   if(nextDate){const newId=randomUUID();const {rows:created}=await pool.query(`INSERT INTO tasks(id,user_id,title,category,priority,due_date,completed,minutes,start_time,end_time,notes,reminder_time,recurrence_rule,recurrence_days,recurrence_end,recurrence_parent_id,status) VALUES($1,$2,$3,$4,$5,$6,FALSE,$7,$8,$9,$10,$11,$12,$13,$14,$15,'todo') RETURNING *`,[newId,req.user.id,task.title,task.category,task.priority,nextDate,task.minutes,task.start_time,task.end_time,task.notes,task.reminder_time,task.recurrence_rule,JSON.stringify(task.recurrence_days||[]),task.recurrence_end,task.recurrence_parent_id||task.id]);nextOccurrence=created[0];}
   }
   res.json({item:task,nextOccurrence});
  }catch(e){next(e)}
 });
-app.delete('/api/tasks/:id',auth,async(req,res,next)=>{try{const existing=await pool.query('SELECT title FROM tasks WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]);if(!existing.rows[0])return res.status(404).json({error:'Task not found.'});await logTaskEvent(req.user.id,req.params.id,'deleted',{title:existing.rows[0].title});await pool.query('DELETE FROM tasks WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]);res.json({ok:true});}catch(e){next(e)}});
+app.delete('/api/tasks/:id',auth,async(req,res,next)=>{try{const result=await pool.query('DELETE FROM tasks WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]);if(!result.rowCount)return res.status(404).json({error:'Task not found.'});res.json({ok:true});}catch(e){next(e)}});
 app.post('/api/tasks/:id/remind',auth,async(req,res,next)=>{
  try { const {rows}=await pool.query('SELECT id,title,due_date,reminder_time FROM tasks WHERE id=$1 AND user_id=$2 AND completed=FALSE',[req.params.id,req.user.id]);if(!rows[0])return res.status(404).json({error:'Task not found.'});
   const t=rows[0];const result=await pool.query('INSERT INTO task_notifications(id,user_id,task_id,title,due_date) VALUES($1,$2,$3,$4,$5) ON CONFLICT(task_id) DO NOTHING RETURNING *',[randomUUID(),req.user.id,t.id,t.title,t.due_date]);
@@ -275,7 +295,7 @@ app.post('/api/tasks/:id/remind',auth,async(req,res,next)=>{
   res.json({created:result.rowCount>0,notification:result.rows[0]||null});
  }catch(e){next(e)}
 });
-app.get('/api/productivity',auth,async(req,res,next)=>{try{const prefs=await readPreferences(req.user.id);const tz=validTimezone(req.query.timezone)?req.query.timezone:prefs.timezone;const today=dateInTimezone(tz);const {rows}=await pool.query(`SELECT activity_date::text AS date, COUNT(*)::int AS completed FROM task_completion_events WHERE user_id=$1 AND activity_date >= ($2::date - INTERVAL '365 days') GROUP BY activity_date ORDER BY activity_date`,[req.user.id,today]);res.json({daily:rows,timezone:tz,today});}catch(e){next(e)}});
+app.get('/api/productivity',auth,async(req,res,next)=>{try{const {rows}=await pool.query(`SELECT activity_date::text AS date, COUNT(*)::int AS completed FROM task_completion_events WHERE user_id=$1 AND activity_date >= CURRENT_DATE - INTERVAL '365 days' GROUP BY activity_date ORDER BY activity_date`,[req.user.id]);res.json({daily:rows});}catch(e){next(e)}});
 app.get('/api/notifications',auth,async(req,res,next)=>{try{const {rows}=await pool.query('SELECT * FROM task_notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50',[req.user.id]);res.json({notifications:rows});}catch(e){next(e)}});
 app.patch('/api/notifications/:id/read',auth,async(req,res,next)=>{try{const {rows}=await pool.query('UPDATE task_notifications SET read_at=NOW() WHERE id=$1 AND user_id=$2 RETURNING *',[req.params.id,req.user.id]);if(!rows[0])return res.status(404).json({error:'Notification not found.'});res.json({notification:rows[0]});}catch(e){next(e)}});
 for(const [table,config] of Object.entries(legacyTables)){
