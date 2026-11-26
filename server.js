@@ -73,6 +73,47 @@ CREATE TABLE IF NOT EXISTS job_offers (
  status TEXT NOT NULL DEFAULT 'received', offer_notes TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS job_offers_user_idx ON job_offers(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS job_discovery_preferences (
+ user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ roles JSONB NOT NULL DEFAULT '["Data Analyst","Business Analyst","SQL Developer","Python Developer","Data Engineer","MIS Analyst","Power BI Developer"]'::jsonb,
+ locations JSONB NOT NULL DEFAULT '["Hyderabad","Bengaluru","Pune","Remote"]'::jsonb,
+ experience_level TEXT NOT NULL DEFAULT 'Fresher / 0–1 year',
+ frequency_minutes INTEGER NOT NULL DEFAULT 5,
+ updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS job_sources (
+ id TEXT PRIMARY KEY, company_name TEXT NOT NULL, provider TEXT NOT NULL CHECK(provider IN ('greenhouse','lever')),
+ board_slug TEXT NOT NULL, career_url TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE,
+ last_checked_at TIMESTAMPTZ, last_error TEXT, jobs_found INTEGER NOT NULL DEFAULT 0,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(provider,board_slug)
+);
+CREATE TABLE IF NOT EXISTS discovered_jobs (
+ id UUID PRIMARY KEY, source_id TEXT NOT NULL REFERENCES job_sources(id) ON DELETE CASCADE,
+ external_id TEXT NOT NULL, title TEXT NOT NULL, company TEXT NOT NULL, location TEXT,
+ description TEXT, apply_url TEXT NOT NULL, canonical_url TEXT, workplace_type TEXT, is_open BOOLEAN NOT NULL DEFAULT TRUE, updated_at TIMESTAMPTZ,
+ first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ UNIQUE(source_id,external_id)
+);
+ALTER TABLE discovered_jobs ADD COLUMN IF NOT EXISTS canonical_url TEXT;
+ALTER TABLE discovered_jobs ADD COLUMN IF NOT EXISTS is_open BOOLEAN NOT NULL DEFAULT TRUE;
+CREATE UNIQUE INDEX IF NOT EXISTS discovered_jobs_canonical_url_idx ON discovered_jobs(canonical_url);
+CREATE INDEX IF NOT EXISTS discovered_jobs_seen_idx ON discovered_jobs(last_seen_at DESC);
+CREATE TABLE IF NOT EXISTS user_saved_jobs (
+ user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ job_id UUID NOT NULL REFERENCES discovered_jobs(id) ON DELETE CASCADE,
+ saved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), auto_saved BOOLEAN NOT NULL DEFAULT FALSE,
+ dismissed_at TIMESTAMPTZ, tracked_application_id TEXT REFERENCES job_applications(id) ON DELETE SET NULL,
+ PRIMARY KEY(user_id,job_id)
+);
+CREATE INDEX IF NOT EXISTS user_saved_jobs_user_idx ON user_saved_jobs(user_id,saved_at DESC);
+CREATE TABLE IF NOT EXISTS job_discovery_notifications (
+ id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ job_id UUID NOT NULL REFERENCES discovered_jobs(id) ON DELETE CASCADE,
+ title TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), read_at TIMESTAMPTZ,
+ UNIQUE(user_id,job_id)
+);
+CREATE INDEX IF NOT EXISTS job_discovery_notifications_user_idx ON job_discovery_notifications(user_id,created_at DESC);
+
 CREATE TABLE IF NOT EXISTS task_notifications (id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, title TEXT NOT NULL, due_date DATE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), read_at TIMESTAMPTZ, UNIQUE(task_id));
 CREATE TABLE IF NOT EXISTS task_completion_events (id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, activity_date DATE NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, task_id, activity_date));
 CREATE INDEX IF NOT EXISTS task_completion_user_date_idx ON task_completion_events(user_id, activity_date DESC);
@@ -225,6 +266,102 @@ const offerFields=['application_id','salary','currency','joining_date','response
 app.post('/api/offers',auth,async(req,res,next)=>{try{const data={};for(const k of offerFields)if(k in req.body)data[k]=req.body[k];if(!data.application_id)return res.status(400).json({error:'Select a job application.'});const valid=await pool.query('SELECT id FROM job_applications WHERE id=$1 AND user_id=$2',[data.application_id,req.user.id]);if(!valid.rowCount)return res.status(400).json({error:'Selected application was not found.'});const id=randomUUID(),keys=Object.keys(data),cols=['id','user_id',...keys],vals=[id,req.user.id,...keys.map(k=>cleanValue(k,data[k]))],ph=vals.map((_,i)=>`$${i+1}`);const {rows}=await pool.query(`INSERT INTO job_offers(${cols.join(',')}) VALUES(${ph.join(',')}) ON CONFLICT(application_id) DO UPDATE SET salary=EXCLUDED.salary,currency=EXCLUDED.currency,joining_date=EXCLUDED.joining_date,response_deadline=EXCLUDED.response_deadline,status=EXCLUDED.status,offer_notes=EXCLUDED.offer_notes,updated_at=NOW() RETURNING *`,vals);res.status(201).json({offer:rows[0]});}catch(e){next(e)}});
 app.patch('/api/offers/:id',auth,async(req,res,next)=>{try{const data={};for(const k of offerFields)if(k in req.body)data[k]=req.body[k];const keys=Object.keys(data);if(!keys.length)return res.status(400).json({error:'No offer fields supplied.'});const vals=keys.map(k=>cleanValue(k,data[k])),sets=keys.map((k,i)=>`${k}=$${i+1}`);vals.push(req.params.id,req.user.id);const {rows}=await pool.query(`UPDATE job_offers SET ${sets.join(',')},updated_at=NOW() WHERE id=$${keys.length+1} AND user_id=$${keys.length+2} RETURNING *`,vals);if(!rows[0])return res.status(404).json({error:'Offer not found.'});res.json({offer:rows[0]});}catch(e){next(e)}});
 
+
+const starterJobSources = [
+ {id:'lever-paytm',company_name:'Paytm',provider:'lever',board_slug:'paytm',career_url:'https://jobs.lever.co/paytm'},
+ {id:'lever-brillio',company_name:'Brillio',provider:'lever',board_slug:'brillio-2',career_url:'https://jobs.lever.co/brillio-2'},
+ {id:'lever-ttec',company_name:'TTEC Digital',provider:'lever',board_slug:'ttecdigital',career_url:'https://jobs.lever.co/ttecdigital'},
+ {id:'lever-weekday',company_name:'Weekday',provider:'lever',board_slug:'weekdayworks',career_url:'https://jobs.lever.co/weekdayworks'},
+ {id:'greenhouse-6sense',company_name:'6sense',provider:'greenhouse',board_slug:'6sense',career_url:'https://boards.greenhouse.io/6sense'},
+ {id:'greenhouse-abnormal',company_name:'Abnormal',provider:'greenhouse',board_slug:'abnormal',career_url:'https://boards.greenhouse.io/abnormal'},
+ {id:'greenhouse-acceldata',company_name:'Acceldata',provider:'greenhouse',board_slug:'acceldata',career_url:'https://boards.greenhouse.io/acceldata'}
+];
+async function ensureJobSources(){
+ for(const s of starterJobSources) await pool.query(`INSERT INTO job_sources(id,company_name,provider,board_slug,career_url) VALUES($1,$2,$3,$4,$5) ON CONFLICT(provider,board_slug) DO NOTHING`,[s.id,s.company_name,s.provider,s.board_slug,s.career_url]);
+}
+const defaultDiscoveryPrefs={roles:['Data Analyst','Business Analyst','SQL Developer','Python Developer','Data Engineer','MIS Analyst','Power BI Developer'],locations:['Hyderabad','Bengaluru','Pune','Remote'],experience_level:'Fresher / 0–1 year',frequency_minutes:5};
+function jobMatches(job,prefs){
+ const title=String(job.title||'').toLowerCase(), body=String(job.description||'').toLowerCase(), loc=String(job.location||'').toLowerCase();
+ const roleTerms={
+  'Data Analyst':['data analyst','analytics analyst','business intelligence analyst','reporting analyst'],
+  'Business Analyst':['business analyst','business systems analyst'],
+  'SQL Developer':['sql developer','database developer','sql analyst'],
+  'Python Developer':['python developer','python engineer'],
+  'Data Engineer':['data engineer','analytics engineer'],
+  'MIS Analyst':['mis analyst','mis executive','reporting executive'],
+  'Power BI Developer':['power bi','bi developer','business intelligence developer']
+ };
+ const roleHit=(prefs.roles||defaultDiscoveryPrefs.roles).some(role=>(roleTerms[role]||[role.toLowerCase()]).some(term=>title.includes(term)));
+ if(!roleHit)return false;
+ const locations=prefs.locations||defaultDiscoveryPrefs.locations;
+ if(locations.length&&!locations.some(x=>{const v=x.toLowerCase();return v==='remote'?(loc.includes('remote')||String(job.workplace_type||'').toLowerCase().includes('remote')):loc.includes(v)||((v==='bengaluru')&&loc.includes('bangalore'))}))return false;
+ const combined=`${title} ${body}`;
+ if(/\b(senior|sr\.?|lead|principal|staff|manager|director|architect|head of)\b/i.test(title))return false;
+ const explicitYears=[...combined.matchAll(/(\d{1,2})\s*\+?\s*(?:years?|yrs?)(?:\s+of)?\s+(?:relevant\s+)?experience/gi)].map(m=>Number(m[1]));
+ if(explicitYears.some(n=>n>1))return false;
+ if(/\b(2\s*[-–]\s*\d+|minimum\s+2|at least 2)\s*(?:years?|yrs?)\b/i.test(body))return false;
+ return true;
+}
+function canonicalJobUrl(value,job){try{const u=new URL(value);u.hash='';for(const k of [...u.searchParams.keys()])if(/^utm_/i.test(k)||['source','ref','referrer','gh_src'].includes(k.toLowerCase()))u.searchParams.delete(k);u.hostname=u.hostname.toLowerCase();u.pathname=u.pathname.replace(/\/$/,'');return u.toString().toLowerCase()}catch{return `fingerprint:${[job.company,job.title,job.location].map(x=>String(x||'').trim().toLowerCase()).join('|')}`}}
+function normalizeJob(source,item){
+ const loc=source.provider==='greenhouse'?(item.location?.name||''):(item.categories?.location||'');
+ const desc=source.provider==='greenhouse'?(item.content||''):(item.descriptionPlain||item.description||'');
+ const url=source.provider==='greenhouse'?(item.absolute_url||''):(item.hostedUrl||item.applyUrl||'');
+ return {external_id:String(item.id||''),title:String(item.title||'').trim(),company:source.company_name,location:String(loc||'Not specified'),description:String(desc||'').replace(/<[^>]*>/g,' ').slice(0,30000),apply_url:url,workplace_type:item.workplaceType||''};
+}
+let jobPollInFlight=false;
+async function pollJobSources(){
+ if(jobPollInFlight)return;jobPollInFlight=true;let pollLockClient=null;
+ try{
+  await ensureDb();pollLockClient=await pool.connect();const lock=await pollLockClient.query("SELECT pg_try_advisory_lock(hashtext('careeros_job_discovery_poller')) AS locked");if(!lock.rows[0].locked){pollLockClient.release();pollLockClient=null;return;}await ensureJobSources();
+  const {rows:sources}=await pool.query('SELECT * FROM job_sources WHERE active=TRUE ORDER BY company_name');
+  for(const source of sources){
+   try{
+    const endpoint=source.provider==='greenhouse'?`https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(source.board_slug)}/jobs?content=true`:`https://api.lever.co/v0/postings/${encodeURIComponent(source.board_slug)}?mode=json`;
+    const response=await fetch(endpoint,{headers:{'Accept':'application/json','User-Agent':'CareerOS Job Discovery/1.0'},signal:AbortSignal.timeout(18000)});
+    if(!response.ok)throw new Error(`Source returned HTTP ${response.status}`);
+    const payload=await response.json();if(source.provider==='greenhouse'&&!Array.isArray(payload.jobs))throw new Error('Unexpected Greenhouse response format');if(source.provider==='lever'&&!Array.isArray(payload))throw new Error('Unexpected Lever response format');const items=source.provider==='greenhouse'?payload.jobs:payload;let found=0;await pool.query('UPDATE discovered_jobs SET is_open=FALSE WHERE source_id=$1',[source.id]);
+    for(const item of items){const job=normalizeJob(source,item);if(!job.external_id||!job.title||!job.apply_url)continue;found++;
+     const canonical=canonicalJobUrl(job.apply_url,job);const {rows}=await pool.query(`INSERT INTO discovered_jobs(id,source_id,external_id,title,company,location,description,apply_url,canonical_url,workplace_type,is_open,updated_at,last_seen_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,TRUE,$11,NOW()) ON CONFLICT(canonical_url) DO UPDATE SET title=EXCLUDED.title,location=EXCLUDED.location,description=EXCLUDED.description,apply_url=EXCLUDED.apply_url,workplace_type=EXCLUDED.workplace_type,is_open=TRUE,updated_at=EXCLUDED.updated_at,last_seen_at=NOW() RETURNING id`,[randomUUID(),source.id,job.external_id,job.title,job.company,job.location,job.description,job.apply_url,canonical,job.workplace_type,item.updatedAt||item.updated_at||null]);
+     const savedJobId=rows[0]?.id;if(!savedJobId)continue;
+     const {rows:users}=await pool.query('SELECT user_id,roles,locations,experience_level,frequency_minutes FROM job_discovery_preferences');
+     for(const pref of users){if(!jobMatches(job,pref))continue;
+      const prior=await pool.query('SELECT saved_at FROM user_saved_jobs WHERE user_id=$1 AND job_id=$2',[pref.user_id,savedJobId]);
+      await pool.query(`INSERT INTO user_saved_jobs(user_id,job_id,auto_saved) VALUES($1,$2,TRUE) ON CONFLICT(user_id,job_id) DO NOTHING`,[pref.user_id,savedJobId]);
+      if(!prior.rowCount)await pool.query('INSERT INTO job_discovery_notifications(id,user_id,job_id,title) VALUES($1,$2,$3,$4) ON CONFLICT(user_id,job_id) DO NOTHING',[randomUUID(),pref.user_id,savedJobId,`${job.title} at ${job.company}`]);
+     }
+    }
+    await pool.query('UPDATE job_sources SET last_checked_at=NOW(),last_error=NULL,jobs_found=$2 WHERE id=$1',[source.id,found]);
+   }catch(error){await pool.query('UPDATE job_sources SET last_checked_at=NOW(),last_error=$2 WHERE id=$1',[source.id,String(error.message||error).slice(0,500)]);console.error(`Job source ${source.id}:`,error.message)}
+  }
+ }catch(error){console.error('Job discovery polling failed:',error)}finally{if(pollLockClient){try{await pollLockClient.query("SELECT pg_advisory_unlock(hashtext('careeros_job_discovery_poller'))")}catch{}pollLockClient.release()}jobPollInFlight=false}
+}
+app.get('/api/discover-jobs',auth,async(req,res,next)=>{
+ try{await pool.query(`INSERT INTO job_discovery_preferences(user_id) VALUES($1) ON CONFLICT(user_id) DO NOTHING`,[req.user.id]);void pollJobSources();const savedOnly=req.query.saved==='true';const {rows}=await pool.query(`SELECT j.*,s.provider,s.career_url,us.saved_at,us.auto_saved,us.dismissed_at,us.tracked_application_id,
+ EXISTS(SELECT 1 FROM job_applications a WHERE a.user_id=$1 AND a.job_id=j.source_id||':'||j.external_id) AS tracked
+ FROM discovered_jobs j JOIN job_sources s ON s.id=j.source_id LEFT JOIN user_saved_jobs us ON us.job_id=j.id AND us.user_id=$1
+ WHERE j.is_open=TRUE AND j.last_seen_at>NOW()-INTERVAL '45 days' AND us.user_id=$1 AND ($2::boolean=FALSE OR us.saved_at IS NOT NULL) AND (us.dismissed_at IS NULL)
+ ORDER BY j.first_seen_at DESC LIMIT 250`,[req.user.id,savedOnly]);
+ const sources=await pool.query('SELECT id,company_name,provider,career_url,last_checked_at,last_error,jobs_found FROM job_sources ORDER BY company_name');
+ const prefs=await pool.query('SELECT roles,locations,experience_level,frequency_minutes FROM job_discovery_preferences WHERE user_id=$1',[req.user.id]);
+ const notifications=await pool.query('SELECT COUNT(*)::int AS unread FROM job_discovery_notifications WHERE user_id=$1 AND read_at IS NULL',[req.user.id]);
+ res.json({jobs:rows,sources:sources.rows,preferences:prefs.rows[0]||defaultDiscoveryPrefs,unread:notifications.rows[0].unread});
+ }catch(e){next(e)}
+});
+app.put('/api/discover-jobs/preferences',auth,async(req,res,next)=>{
+ try{const roles=Array.isArray(req.body.roles)?req.body.roles.filter(x=>defaultDiscoveryPrefs.roles.includes(x)):defaultDiscoveryPrefs.roles;const locations=Array.isArray(req.body.locations)?req.body.locations.filter(x=>defaultDiscoveryPrefs.locations.includes(x)):defaultDiscoveryPrefs.locations;const {rows}=await pool.query(`INSERT INTO job_discovery_preferences(user_id,roles,locations,experience_level,frequency_minutes) VALUES($1,$2,$3,'Fresher / 0–1 year',5) ON CONFLICT(user_id) DO UPDATE SET roles=EXCLUDED.roles,locations=EXCLUDED.locations,updated_at=NOW() RETURNING roles,locations,experience_level,frequency_minutes`,[req.user.id,JSON.stringify(roles),JSON.stringify(locations)]);res.json({preferences:rows[0]});void pollJobSources();}catch(e){next(e)}
+});
+app.post('/api/discover-jobs/:id/save',auth,async(req,res,next)=>{try{const exists=await pool.query('SELECT id FROM discovered_jobs WHERE id=$1',[req.params.id]);if(!exists.rowCount)return res.status(404).json({error:'Job listing not found.'});await pool.query('INSERT INTO user_saved_jobs(user_id,job_id,auto_saved) VALUES($1,$2,FALSE) ON CONFLICT(user_id,job_id) DO UPDATE SET dismissed_at=NULL',[req.user.id,req.params.id]);res.json({ok:true})}catch(e){next(e)}});
+app.post('/api/discover-jobs/:id/dismiss',auth,async(req,res,next)=>{try{await pool.query('INSERT INTO user_saved_jobs(user_id,job_id,dismissed_at) VALUES($1,$2,NOW()) ON CONFLICT(user_id,job_id) DO UPDATE SET dismissed_at=NOW()',[req.user.id,req.params.id]);res.json({ok:true})}catch(e){next(e)}});
+app.post('/api/discover-jobs/:id/track',auth,async(req,res,next)=>{
+ try{const {rows}=await pool.query('SELECT j.*,s.provider FROM discovered_jobs j JOIN job_sources s ON s.id=j.source_id WHERE j.id=$1',[req.params.id]);if(!rows[0])return res.status(404).json({error:'Job listing not found.'});const j=rows[0],jobId=`${j.source_id}:${j.external_id}`;let application=await pool.query('SELECT * FROM job_applications WHERE user_id=$1 AND job_id=$2',[req.user.id,jobId]);const alreadyTracked=Boolean(application.rowCount);
+  if(!application.rowCount){const id=randomUUID();application=await pool.query(`INSERT INTO job_applications(id,user_id,company,role,status,location,url,job_id,source,experience_level,job_description) VALUES($1,$2,$3,$4,'saved',$5,$6,$7,$8,'Fresher / 0–1 year',$9) RETURNING *`,[id,req.user.id,j.company,j.title,j.location,j.apply_url,jobId,j.provider,j.description]);}
+  await pool.query('INSERT INTO user_saved_jobs(user_id,job_id,tracked_application_id) VALUES($1,$2,$3) ON CONFLICT(user_id,job_id) DO UPDATE SET tracked_application_id=EXCLUDED.tracked_application_id',[req.user.id,j.id,application.rows[0].id]);res.status(201).json({application:application.rows[0],alreadyTracked});
+ }catch(e){next(e)}
+});
+app.get('/api/discover-jobs/notifications',auth,async(req,res,next)=>{try{const {rows}=await pool.query('SELECT * FROM job_discovery_notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50',[req.user.id]);res.json({notifications:rows})}catch(e){next(e)}});
+app.patch('/api/discover-jobs/notifications/:id/read',auth,async(req,res,next)=>{try{const {rows}=await pool.query('UPDATE job_discovery_notifications SET read_at=NOW() WHERE id=$1 AND user_id=$2 RETURNING *',[req.params.id,req.user.id]);if(!rows[0])return res.status(404).json({error:'Notification not found.'});res.json({notification:rows[0]})}catch(e){next(e)}});
+
 app.get('/api/bootstrap',auth,async(req,res,next)=>{
  try { const {rows}=await pool.query('SELECT * FROM tasks WHERE user_id=$1 ORDER BY due_date NULLS LAST, start_time NULLS LAST, created_at DESC',[req.user.id]); res.json({tasks:rows}); }
  catch(e){next(e)}
@@ -359,4 +496,4 @@ app.use('/api',(err,req,res,_next)=>{console.error(err);res.status(500).json({er
 const __dirname=path.dirname(fileURLToPath(import.meta.url));
 app.use(express.static(path.join(__dirname,'dist')));
 app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'dist','index.html')));
-app.listen(PORT,'0.0.0.0',()=>console.log(`CareerOS daily task manager listening on ${PORT}`));
+app.listen(PORT,'0.0.0.0',()=>{console.log(`CareerOS daily task manager listening on ${PORT}`);setTimeout(()=>pollJobSources(),12000);setInterval(()=>pollJobSources(),5*60*1000);});
