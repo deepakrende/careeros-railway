@@ -55,6 +55,24 @@ ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT
 CREATE INDEX IF NOT EXISTS resumes_user_idx ON resumes(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS job_applications_user_applied_idx ON job_applications(user_id, applied_on DESC);
 CREATE INDEX IF NOT EXISTS job_applications_user_status_idx ON job_applications(user_id, status);
+CREATE TABLE IF NOT EXISTS interviews (
+ id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ application_id TEXT NOT NULL REFERENCES job_applications(id) ON DELETE CASCADE,
+ round_type TEXT NOT NULL DEFAULT 'Technical', interview_date DATE NOT NULL, interview_time TIME,
+ duration_minutes INTEGER NOT NULL DEFAULT 60, meeting_link TEXT, interviewer_name TEXT,
+ status TEXT NOT NULL DEFAULT 'scheduled', preparation_notes TEXT, questions TEXT, feedback TEXT,
+ result TEXT, reminder_time TIME, linked_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS interviews_user_date_idx ON interviews(user_id, interview_date, interview_time);
+CREATE INDEX IF NOT EXISTS interviews_application_idx ON interviews(user_id, application_id);
+CREATE TABLE IF NOT EXISTS job_offers (
+ id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ application_id TEXT NOT NULL UNIQUE REFERENCES job_applications(id) ON DELETE CASCADE,
+ salary TEXT, currency TEXT NOT NULL DEFAULT 'INR', joining_date DATE, response_deadline DATE,
+ status TEXT NOT NULL DEFAULT 'received', offer_notes TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS job_offers_user_idx ON job_offers(user_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS task_notifications (id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, title TEXT NOT NULL, due_date DATE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), read_at TIMESTAMPTZ, UNIQUE(task_id));
 CREATE TABLE IF NOT EXISTS task_completion_events (id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, activity_date DATE NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, task_id, activity_date));
 CREATE INDEX IF NOT EXISTS task_completion_user_date_idx ON task_completion_events(user_id, activity_date DESC);
@@ -172,6 +190,40 @@ app.delete('/api/job-applications/:id', auth, async(req,res,next)=>{
  try {const r=await pool.query('DELETE FROM job_applications WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]);if(!r.rowCount)return res.status(404).json({error:'Application not found.'});res.json({ok:true});}
  catch(e){next(e)}
 });
+
+// Phase 4: interview rounds, preparation records and job offers.
+app.get('/api/interviews',auth,async(req,res,next)=>{
+ try {const {rows}=await pool.query(`SELECT i.*,j.company,j.role,j.resume_id,r.version_label AS resume_version,r.original_name AS resume_filename FROM interviews i JOIN job_applications j ON j.id=i.application_id AND j.user_id=i.user_id LEFT JOIN resumes r ON r.id=j.resume_id AND r.user_id=j.user_id WHERE i.user_id=$1 ORDER BY i.interview_date ASC,i.interview_time ASC NULLS LAST`,[req.user.id]);res.json({interviews:rows});}catch(e){next(e)}
+});
+const interviewFields=['application_id','round_type','interview_date','interview_time','duration_minutes','meeting_link','interviewer_name','status','preparation_notes','questions','feedback','result','reminder_time'];
+const interviewStatuses=['scheduled','completed','cancelled','rescheduled','awaiting_feedback'];
+app.post('/api/interviews',auth,async(req,res,next)=>{
+ const client=await pool.connect();
+ try {const data={};for(const k of interviewFields)if(k in req.body)data[k]=req.body[k];
+  if(!data.application_id||!data.interview_date||!data.round_type)return res.status(400).json({error:'Choose a job application, interview date and round type.'});
+  const appRow=await client.query('SELECT company,role FROM job_applications WHERE id=$1 AND user_id=$2',[data.application_id,req.user.id]);if(!appRow.rowCount)return res.status(400).json({error:'Selected job application was not found.'});
+  data.status=data.status||'scheduled';if(!interviewStatuses.includes(data.status))return res.status(400).json({error:'Choose a valid interview status.'});
+  await client.query('BEGIN');const id=randomUUID(),taskId=randomUUID();
+  const taskTitle=`Interview: ${appRow.rows[0].company} — ${appRow.rows[0].role} (${data.round_type})`;
+  await client.query(`INSERT INTO tasks(id,user_id,title,category,priority,due_date,start_time,minutes,reminder_time,notes,status,completed) VALUES($1,$2,$3,'Interview prep','High',$4,$5,$6,$7,$8,'todo',FALSE)`,[taskId,req.user.id,taskTitle,data.interview_date,data.interview_time||null,Number(data.duration_minutes)||60,data.reminder_time||null,data.preparation_notes||'']);
+  const keys=Object.keys(data),cols=['id','user_id','linked_task_id',...keys],vals=[id,req.user.id,taskId,...keys.map(k=>cleanValue(k,data[k]))],ph=vals.map((_,i)=>`$${i+1}`);
+  const {rows}=await client.query(`INSERT INTO interviews(${cols.join(',')}) VALUES(${ph.join(',')}) RETURNING *`,vals);await client.query('COMMIT');res.status(201).json({interview:rows[0]});
+ }catch(e){await client.query('ROLLBACK').catch(()=>{});next(e)}finally{client.release()}
+});
+app.patch('/api/interviews/:id',auth,async(req,res,next)=>{
+ const client=await pool.connect();try{const data={};for(const k of interviewFields)if(k in req.body)data[k]=req.body[k];if(data.status&&!interviewStatuses.includes(data.status))return res.status(400).json({error:'Choose a valid interview status.'});
+  await client.query('BEGIN');const existing=await client.query('SELECT * FROM interviews WHERE id=$1 AND user_id=$2 FOR UPDATE',[req.params.id,req.user.id]);if(!existing.rowCount){await client.query('ROLLBACK');return res.status(404).json({error:'Interview not found.'})}
+  if(data.application_id){const valid=await client.query('SELECT id FROM job_applications WHERE id=$1 AND user_id=$2',[data.application_id,req.user.id]);if(!valid.rowCount){await client.query('ROLLBACK');return res.status(400).json({error:'Selected application was not found.'})}}
+  const keys=Object.keys(data);let rows=[existing.rows[0]];if(keys.length){const vals=keys.map(k=>cleanValue(k,data[k])),sets=keys.map((k,i)=>`${k}=$${i+1}`);vals.push(req.params.id,req.user.id);({rows}=await client.query(`UPDATE interviews SET ${sets.join(',')},updated_at=NOW() WHERE id=$${keys.length+1} AND user_id=$${keys.length+2} RETURNING *`,vals));}
+  const iv=rows[0];if(iv.linked_task_id){const appRow=await client.query('SELECT company,role FROM job_applications WHERE id=$1 AND user_id=$2',[iv.application_id,req.user.id]);const title=`Interview: ${appRow.rows[0]?.company||'Company'} — ${appRow.rows[0]?.role||'Role'} (${iv.round_type})`;await client.query(`UPDATE tasks SET title=$1,due_date=$2,start_time=$3,minutes=$4,reminder_time=$5,notes=$6,status=$7,completed=$8 WHERE id=$9 AND user_id=$10`,[title,iv.interview_date,iv.interview_time,iv.duration_minutes,iv.reminder_time,iv.preparation_notes,iv.status==='completed'?'completed':'todo',iv.status==='completed',iv.linked_task_id,req.user.id]);}
+  await client.query('COMMIT');res.json({interview:iv});
+ }catch(e){await client.query('ROLLBACK').catch(()=>{});next(e)}finally{client.release()}
+});
+app.delete('/api/interviews/:id',auth,async(req,res,next)=>{try{const {rows}=await pool.query('DELETE FROM interviews WHERE id=$1 AND user_id=$2 RETURNING linked_task_id',[req.params.id,req.user.id]);if(!rows[0])return res.status(404).json({error:'Interview not found.'});if(rows[0].linked_task_id)await pool.query('DELETE FROM tasks WHERE id=$1 AND user_id=$2',[rows[0].linked_task_id,req.user.id]);res.json({ok:true});}catch(e){next(e)}});
+app.get('/api/offers',auth,async(req,res,next)=>{try{const {rows}=await pool.query(`SELECT o.*,j.company,j.role FROM job_offers o JOIN job_applications j ON j.id=o.application_id AND j.user_id=o.user_id WHERE o.user_id=$1 ORDER BY o.created_at DESC`,[req.user.id]);res.json({offers:rows});}catch(e){next(e)}});
+const offerFields=['application_id','salary','currency','joining_date','response_deadline','status','offer_notes'];
+app.post('/api/offers',auth,async(req,res,next)=>{try{const data={};for(const k of offerFields)if(k in req.body)data[k]=req.body[k];if(!data.application_id)return res.status(400).json({error:'Select a job application.'});const valid=await pool.query('SELECT id FROM job_applications WHERE id=$1 AND user_id=$2',[data.application_id,req.user.id]);if(!valid.rowCount)return res.status(400).json({error:'Selected application was not found.'});const id=randomUUID(),keys=Object.keys(data),cols=['id','user_id',...keys],vals=[id,req.user.id,...keys.map(k=>cleanValue(k,data[k]))],ph=vals.map((_,i)=>`$${i+1}`);const {rows}=await pool.query(`INSERT INTO job_offers(${cols.join(',')}) VALUES(${ph.join(',')}) ON CONFLICT(application_id) DO UPDATE SET salary=EXCLUDED.salary,currency=EXCLUDED.currency,joining_date=EXCLUDED.joining_date,response_deadline=EXCLUDED.response_deadline,status=EXCLUDED.status,offer_notes=EXCLUDED.offer_notes,updated_at=NOW() RETURNING *`,vals);res.status(201).json({offer:rows[0]});}catch(e){next(e)}});
+app.patch('/api/offers/:id',auth,async(req,res,next)=>{try{const data={};for(const k of offerFields)if(k in req.body)data[k]=req.body[k];const keys=Object.keys(data);if(!keys.length)return res.status(400).json({error:'No offer fields supplied.'});const vals=keys.map(k=>cleanValue(k,data[k])),sets=keys.map((k,i)=>`${k}=$${i+1}`);vals.push(req.params.id,req.user.id);const {rows}=await pool.query(`UPDATE job_offers SET ${sets.join(',')},updated_at=NOW() WHERE id=$${keys.length+1} AND user_id=$${keys.length+2} RETURNING *`,vals);if(!rows[0])return res.status(404).json({error:'Offer not found.'});res.json({offer:rows[0]});}catch(e){next(e)}});
 
 app.get('/api/bootstrap',auth,async(req,res,next)=>{
  try { const {rows}=await pool.query('SELECT * FROM tasks WHERE user_id=$1 ORDER BY due_date NULLS LAST, start_time NULLS LAST, created_at DESC',[req.user.id]); res.json({tasks:rows}); }
