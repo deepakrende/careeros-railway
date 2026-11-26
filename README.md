@@ -1,53 +1,77 @@
-# CareerOS — Daily Task Manager
+# CareerOS — Phase 1 & Phase 2
 
-A daily task manager built with React, Vite, Express, and Railway PostgreSQL.
+CareerOS is a personal productivity workspace built with React, Vite, Express, and Railway PostgreSQL.
 
-## Features
+## Included in this update
 
-- Email/password registration and login (existing JWT authentication retained).
-- Daily task list with Today, All tasks, Upcoming, Completed, and Inbox views.
-- Create, edit, complete, and delete tasks.
-- Task category, priority, due date, start/end time, estimated duration, and notes.
-- In-app reminders shown in the notification centre while the user has CareerOS open.
-- Recurring tasks: every day, weekdays, weekly, or selected weekdays; optional repeat-until date.
-- When a recurring task is completed, the next occurrence is automatically created.
-- Search and category/priority filters.
-- Responsive layout and light/dark appearance switch.
-- All task data and notifications are stored in Railway PostgreSQL.
+### Phase 1 — Foundation
+- Existing email/password registration and login retained; JWT secret and password hashes are unchanged.
+- Additive per-user preferences table for display name, target role, location, timezone, theme, week start day, and daily completion goal.
+- Settings page to edit profile and planner preferences.
+- Dark/light theme preference stored in PostgreSQL and synchronized across signed-in devices.
+- Timezone validation using IANA timezone names.
+- Task activity audit events for task creation, updates, status changes, and deletion.
+- Optional Railway Volume mount initialization through `FILE_STORAGE_DIR`, prepared for resume/document uploads in a later phase.
 
-## Railway deployment
+### Phase 2 — Daily Productivity
+- Daily task dashboard and completion progress.
+- Overdue, upcoming, completed, inbox, and all-task views.
+- To Do, In Progress, and Completed task statuses.
+- Create, edit, reschedule, and delete tasks.
+- Weekly planner with configurable Monday/Sunday week start.
+- In-app reminder centre and notification history.
+- Recurring tasks and next-occurrence generation.
+- Completion history, streaks, and productivity reports.
+- Timezone-aware day boundaries and reminder scheduling.
+- Personal daily completion goal.
+- Responsive layout and persisted dark/light appearance.
 
-The application serves the built frontend and API from one Railway service.
+## Architecture
 
-### Required variables on the app service
+- Frontend: React 18 + Vite
+- Backend: Node.js + Express
+- Database: Railway PostgreSQL
+- Authentication: existing bcrypt password hashes + JWT bearer tokens
+- Persistent file storage: Railway Volume mounted at `/data` (reserved for resume/document uploads in Phase 3)
 
-- `DATABASE_URL`: Railway PostgreSQL connection string or Railway reference such as `${{Postgres.DATABASE_URL}}` (replace `Postgres` with the exact database service name).
-- `JWT_SECRET`: a private random secret with at least 32 characters.
+The app is served by one Railway service. Express serves the built `dist` directory and the `/api` routes.
+
+## Railway environment variables
+
+Required on the app service:
+
+- `DATABASE_URL`: Railway PostgreSQL connection string or Railway reference such as `${{Postgres.DATABASE_URL}}` (use your actual database service name).
+- `JWT_SECRET`: existing private JWT signing secret. Keep the existing value; do not rotate it during this deployment.
 
 Optional:
-- `PGSSL=true` only if your database connection requires SSL settings beyond Railway's normal connection URL.
 
-### Build and start
+- `PGSSL=true` only if your PostgreSQL connection requires it.
+- `FILE_STORAGE_DIR=/data` after attaching a Railway Volume mounted at `/data`.
+
+## Railway Volume setup
+
+1. Open the CareerOS app service in Railway.
+2. Add a Volume to that service.
+3. Set its mount path to `/data`.
+4. Add the service variable `FILE_STORAGE_DIR=/data`.
+5. Redeploy the service.
+6. Check `/api/health`; `fileStorageConfigured` should be `true`.
+
+This phase only prepares and verifies the persistent mount directory. Resume and document upload endpoints are deliberately part of the later Resume Vault phase; no files are written in this phase.
+
+## Build and deploy
 
 - Build command: `npm run build`
 - Start command: `npm start`
+- The Express server listens on Railway's `PORT`.
 
-The Express server listens on Railway's `PORT` and serves the built `dist` directory.
+Deploy by replacing only the files listed in the update package, committing, and pushing to the connected GitHub repository. Railway should then build and deploy automatically.
 
-## Database migration and data preservation
+## Data preservation
 
-On startup, the server runs idempotent `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements. The migration adds scheduling, reminder, recurrence, and notification fields/tables to the existing schema. It does not drop, truncate, or recreate existing user accounts or task records. Existing JWT authentication and password hashes are retained.
+The server performs additive, idempotent startup migrations using `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. This update does not drop, truncate, or recreate users, tasks, notifications, job applications, projects, or learning records. Existing authentication routes, password hashes, JWT format, and tokens are retained.
 
-New task fields:
-- `start_time`, `end_time`, `notes`
-- `reminder_time`, `reminder_notified_at`
-- `recurrence_rule`, `recurrence_days`, `recurrence_end`, `recurrence_parent_id`, `next_occurrence_created`
-
-A new `task_notifications` table stores in-app reminder notifications. Existing job application, project, and learning tables are left intact for backward compatibility, but the interface is now focused on daily task management.
-
-## Reminder behaviour
-
-In-app reminders are checked by the browser every 30 seconds while the user is signed in and the app is open. They are saved to PostgreSQL and shown in the notification bell. Since the selected reminder type is in-app only, reminders are not delivered when the browser/app is closed, and there are no email, SMS, or push notifications.
+A PostgreSQL backup before deploying schema changes is still recommended. Never delete the existing Railway PostgreSQL service or volume as part of this update.
 
 ## Local development
 
@@ -58,4 +82,4 @@ cp .env.example .env
 npm run dev
 ```
 
-In a second terminal run `npm start` (or `npm run server`) for the API. Vite proxies `/api` to `http://localhost:3000` during development.
+In a second terminal, run `npm start` for the API. Vite proxies `/api` to `http://localhost:3000` during local development.
